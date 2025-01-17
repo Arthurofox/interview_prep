@@ -1,0 +1,24 @@
+# Basic Settings
+APP_NAME=Interview Preparation Tool
+ENVIRONMENT=development
+DEBUG=true
+API_PREFIX=/api
+WEBSOCKET_PATH=/ws
+
+# AI Settings (you'll need this later, can leave empty for now)
+OPENAI_API_KEY=
+
+# Video Processing Settings
+VIDEO_FRAME_RATE=30
+EMOTION_DETECTION_INTERVAL=5
+
+# Audio Processing Settings
+AUDIO_CHUNK_SIZE=1024
+AUDIO_SAMPLE_RATE=16000
+
+# Server Settings
+HOST=0.0.0.0
+PORT=8000
+
+# Logging
+LOG_LEVEL=DEBUG
