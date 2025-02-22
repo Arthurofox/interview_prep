@@ -2,6 +2,12 @@
 
 Real-time interview analysis tool that provides emotion detection and speech-to-text capabilities to help users improve their interview skills.
 
+
+http://127.0.0.1:8000/
+
+
+
+uvicorn src.interface.api.main:app --reload --reload-dir src
 ## Features 🌟
 
 - Real-time facial emotion detection
@@ -83,3 +89,6 @@ Future improvements planned:
 ## Contributing 🤝
 
 Feel free to open issues and pull requests for improvements!
+
+
+

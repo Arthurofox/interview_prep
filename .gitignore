@@ -1,9 +1,17 @@
-# Python
+# --------------------------------
+# Python artifacts
+# --------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+*.pyd
+
+# Distribution / packaging
 build/
 develop-eggs/
 dist/
@@ -27,22 +35,47 @@ ENV/
 # Environment Variables
 .env
 
-# IDE
+# --------------------------------
+# Logs and other output
+# --------------------------------
+logs/
+*.log
+
+# --------------------------------
+# Test coverage
+# --------------------------------
+.coverage
+htmlcov/
+coverage.xml
+.pytest_cache/
+
+# --------------------------------
+# Video / Audio (project specific)
+# --------------------------------
+*.mp4
+*.wav
+*.avi
+
+# --------------------------------
+# IDE / Editor settings
+# --------------------------------
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# Logs
-logs/
-*.log
+# --------------------------------
+# macOS
+# --------------------------------
+.DS_Store
 
-# Test coverage
-.coverage
-htmlcov/
-coverage.xml
+# --------------------------------
+# Node
+# --------------------------------
+node_modules/
+npm-debug.log
+yarn-error.log
+package-lock.json
 
-# Project specific
-*.mp4
-*.wav
-*.avi
+
+*model
