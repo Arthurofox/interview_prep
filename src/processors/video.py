@@ -10,11 +10,12 @@ import torch
 from PIL import Image
 from torchvision import transforms
 from collections import OrderedDict
+from ..models import emotions
+from ..models import arcface
 
-# Conditionally import specific modules for your model
 try:
-    from models.emotions import EmotionRecognitionModel
-    from models.arcface import ArcFaceBackbone
+    from ..models.emotions import EmotionRecognitionModel
+    from ..models.arcface import ArcFaceBackbone
 except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Could not import model modules - will attempt import when loading model")
@@ -128,7 +129,7 @@ class VideoProcessor:
             logger.info(f"Loading emotion model from: {model_path}")
             
             try:
-                from models.emotions import EmotionRecognitionModel
+                from ..models.emotions import EmotionRecognitionModel
                 logger.info("Successfully imported EmotionRecognitionModel")
             except ImportError as e:
                 logger.error(f"Failed to import EmotionRecognitionModel: {e}")

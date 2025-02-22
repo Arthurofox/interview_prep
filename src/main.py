@@ -26,8 +26,8 @@ PROCESSED_VIDEOS_DIR = Path("uploads")
 PROCESSED_VIDEOS_DIR.mkdir(exist_ok=True)
 
 # Get the absolute path to the project root and static directory
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-STATIC_DIR = PROJECT_ROOT / "interface" / "static"
+PROJECT_ROOT = Path(__file__).parent.parent
+STATIC_DIR = PROJECT_ROOT / "src" / "interface" / "static"
 UPLOAD_DIR = PROJECT_ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 

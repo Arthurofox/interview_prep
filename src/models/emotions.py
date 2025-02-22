@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from models.arcface import ArcFaceBackbone
+from ..models.arcface import ArcFaceBackbone
 
 class EmotionAttention(nn.Module):
     def __init__(self, in_features):
