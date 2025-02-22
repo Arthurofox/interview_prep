@@ -1,67 +1,208 @@
+import os
+import logging
+import json
+from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
+
 import cv2
 import numpy as np
-import logging
-from transformers import pipeline
 import torch
 from PIL import Image
-from pathlib import Path
-import json
-import platform
+from torchvision import transforms
 from collections import OrderedDict
-from src.config import get_settings
+
+# Conditionally import specific modules for your model
+try:
+    from models.emotions import EmotionRecognitionModel
+    from models.arcface import ArcFaceBackbone
+except ImportError:
+    logger = logging.getLogger(__name__)
+    logger.warning("Could not import model modules - will attempt import when loading model")
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_EMOTION_MAPPING = {
+    0: "angry",
+    1: "disgust", 
+    2: "fear", 
+    3: "happy", 
+    4: "sad", 
+    5: "surprise", 
+    6: "neutral",
+    7: "contempt"  # Added contempt as the 8th emotion
+}
 
 class VideoProcessor:
     """
-    Handles video processing for face detection and image-based emotion analysis.
-    Does not perform audio extraction or audio-based analysis.
+    Enhanced Video Processor for face detection and emotion recognition.
+    
+    Features:
+    - Supports multiple face detection backends
+    - Loads custom emotion recognition models
+    - Works with both CUDA and MPS (Apple Silicon)
+    - Tracks faces across frames
+    - Provides detailed emotion analytics
     """
-    def __init__(self):
-        # Determine device for inference (using GPU if available)
-        self.device = 0 if torch.cuda.is_available() else -1
-        device_label = "GPU" if self.device == 0 else "CPU"
-        logger.info(f"Using device: {device_label}")
-
-        # Initialize the image-based emotion detection pipeline
-        # (Using the original model identifier provided, which is an empty string.
-        #  Replace "" with a valid model identifier later if needed.)
-        try:
-            self.emotion_detector = pipeline(
-                "image-classification",
-                model="dima806/facial_emotions_image_detection",
-                device=self.device
-            )
-            logger.info("Image emotion detector initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing emotion detector: {str(e)}")
-            self.emotion_detector = None
-
-        # Initialize face detection (Haar cascade)
-        cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-        self.face_cascade = cv2.CascadeClassifier(cascade_path)
-        if self.face_cascade.empty():
-            logger.error("Failed to load Haar cascade classifier for face detection")
-
-        # Load application settings (if any)
-        self.settings = get_settings()
-
+    def __init__(self, model_path: str = None, device: str = None):
+        # Determine device for inference
+        self.device = self._get_device(device)
+        device_label = "GPU" if self.device in ["cuda", "mps"] else "CPU"
+        logger.info(f"Using device for video processing: {device_label} ({self.device})")
+        
+        # Initialize the face detection system
+        self._init_face_detector()
+        
+        # Initialize the emotion recognition model
+        self.model = None
+        self.transform = None
+        self.emotion_mapping = DEFAULT_EMOTION_MAPPING
+        if model_path:
+            self._load_emotion_model(model_path)
+        
         # Prepare output directory for processed videos and results
         self.output_dir = Path("processed_videos")
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Tracking variables for multiple faces
+        self.tracked_faces = OrderedDict()
+        self.next_face_id = 0
+        self.face_emotions = {}
+        
+        logger.info("VideoProcessor initialized successfully")
 
-        # Log system information
-        self.system = platform.system()
-        logger.info(f"Running on {self.system}")
+    def _get_device(self, device: Optional[str]) -> str:
+        """
+        Determine the appropriate computing device.
+        
+        Args:
+            device: Optional device specification (cuda, mps, or cpu)
+            
+        Returns:
+            String representing the device to use
+        """
+        if device is not None:
+            return device
+            
+        # Auto-detect available devices with detailed logging
+        if torch.cuda.is_available():
+            logger.info(f"CUDA available: {torch.cuda.get_device_name(0)}")
+            return "cuda"
+        elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+            logger.info("MPS available (Apple Silicon)")
+            return "mps"
+        else:
+            logger.info("Using CPU for processing")
+            return "cpu"
+
+    def _init_face_detector(self):
+        """
+        Initialize the face detection system using OpenCV's Haar cascade.
+        Can be extended to support more advanced detectors.
+        """
+        try:
+            # Use OpenCV's built-in Haar cascade detector for compatibility
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            self.face_cascade = cv2.CascadeClassifier(cascade_path)
+            
+            if self.face_cascade.empty():
+                logger.error("Failed to load Haar cascade for face detection")
+                raise RuntimeError("Failed to load face detection model")
+                
+            logger.info("Face detector initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing face detector: {str(e)}")
+            raise
+
+    def _load_emotion_model(self, model_path: str):
+        """
+        Load a pre-trained emotion recognition model.
+        
+        Args:
+            model_path: Path to the PyTorch model file
+        """
+        try:
+            if not os.path.exists(model_path):
+                logger.error(f"Model file not found: {model_path}")
+                raise FileNotFoundError(f"Model file not found: {model_path}")
+            
+            logger.info(f"Loading emotion model from: {model_path}")
+            
+            try:
+                from models.emotions import EmotionRecognitionModel
+                logger.info("Successfully imported EmotionRecognitionModel")
+            except ImportError as e:
+                logger.error(f"Failed to import EmotionRecognitionModel: {e}")
+                raise ImportError(f"Could not import EmotionRecognitionModel: {e}")
+
+
+            self.model = EmotionRecognitionModel(embedding_size=512, num_emotions=8, freeze_backbone=True)
+            
+            # Load model weights
+            checkpoint = torch.load(model_path, map_location=self.device)
+            
+            # Handle different checkpoint formats
+            if isinstance(checkpoint, dict):
+                if "model_state_dict" in checkpoint:
+                    state_dict = checkpoint["model_state_dict"]
+                else:
+                    state_dict = checkpoint
+                
+                # Try to load emotion mapping if present in the checkpoint
+                if "emotion_mapping" in checkpoint:
+                    self.emotion_mapping = checkpoint["emotion_mapping"]
+                    logger.info(f"Loaded emotion mapping from checkpoint: {self.emotion_mapping}")
+            else:
+                state_dict = checkpoint
+            
+            # Load the state dict with appropriate error handling
+            try:
+                self.model.load_state_dict(state_dict)
+                logger.info("Successfully loaded model weights")
+            except Exception as e:
+                logger.warning(f"Error loading exact state dict: {e}")
+                logger.warning("Attempting to load with strict=False")
+                # Try loading with strict=False to handle partial model loading
+                missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+                logger.warning(f"Missing keys: {len(missing_keys)}, Unexpected keys: {len(unexpected_keys)}")
+                
+            # Move model to appropriate device and set to evaluation mode
+            self.model.to(self.device)
+            self.model.eval()
+            
+            # Standard image transformations for deep learning models
+            # Using ImageNet normalization as per common practice with ArcFace models
+            self.transform = transforms.Compose([
+                transforms.Resize((112, 112)),  # ArcFace typically uses 112x112
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],  # ImageNet means
+                    std=[0.229, 0.224, 0.225]    # ImageNet stds
+                )
+            ])
+            
+            logger.info("Emotion recognition model loaded successfully")
+        except Exception as e:
+            logger.error(f"Error loading emotion model: {str(e)}")
+            self.model = None
+            raise
 
     def process_video(self, video_path: str) -> Dict[str, Any]:
         """
-        Analyzes the video to detect faces and classify their emotions.
-        Uses a tracking system to maintain emotion information for each face.
+        Process a video file for face detection and emotion analysis.
+        
+        Args:
+            video_path: Path to the input video file
+            
+        Returns:
+            Dictionary containing analysis results and metadata
         """
         try:
+            # Verify that the input video exists
+            if not os.path.exists(video_path):
+                raise FileNotFoundError(f"Video file not found: {video_path}")
+            
+            # Open the video file
+            logger.info(f"Processing video: {video_path}")
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
                 raise ValueError("Could not open video file")
@@ -77,20 +218,21 @@ class VideoProcessor:
             duration = float(total_frames / fps) if total_frames > 0 else 0.0
 
             # Create annotated output video path and writer
-            annotated_path = str(
-                Path(video_path)
-                .with_stem(Path(video_path).stem + "_annotated")
-                .with_suffix(".mp4")
-            )
+            video_id = Path(video_path).stem
+            annotated_path = str(self.output_dir / f"{video_id}_annotated.mp4")
             out = self._get_video_writer(annotated_path, fps, (frame_width, frame_height))
 
             # Variables for emotion analysis and face tracking
             emotions_over_time: List[Dict[str, Any]] = []
-            frame_interval = int(fps * 1)  # Process emotions every second
-            tracked_faces: OrderedDict[int, Tuple[int, int, int, int]] = OrderedDict()
-            next_face_id = 0
-            face_emotions: Dict[int, Dict[str, float]] = {}
+            frame_interval = max(1, int(fps / 8))  # Process emotions every 1/8 second for smoother results
+            self.tracked_faces = OrderedDict()
+            self.next_face_id = 0
+            self.face_emotions = {}
 
+            # Initialize a progress counter
+            processed_frames = 0
+            
+            # Process the video frame by frame
             while True:
                 ret, frame = cap.read()
                 if not ret:
@@ -98,79 +240,41 @@ class VideoProcessor:
 
                 # Get current frame index
                 frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-
+                processed_frames += 1
+                
                 # Convert frame to grayscale for face detection
                 gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                detected = self.face_cascade.detectMultiScale(gray_frame, scaleFactor=1.1, minNeighbors=4)
-                detected_faces = [(x, y, w, h) for (x, y, w, h) in detected]
-
-                # Match detected faces to previously tracked faces
-                updated_tracked_faces: OrderedDict[int, Tuple[int, int, int, int]] = OrderedDict()
-                for (x, y, w, h) in detected_faces:
-                    matched_id = None
-                    min_dist = float('inf')
-                    for face_id, (tx, ty, tw, th) in tracked_faces.items():
-                        # Calculate Euclidean distance between top-left points
-                        dist = np.hypot(tx - x, ty - y)
-                        if dist < min_dist and dist < 50:
-                            min_dist = dist
-                            matched_id = face_id
-                    if matched_id is not None:
-                        updated_tracked_faces[matched_id] = (x, y, w, h)
-                    else:
-                        updated_tracked_faces[next_face_id] = (x, y, w, h)
-                        next_face_id += 1
-
-                tracked_faces = updated_tracked_faces
-
-                # Process emotions at defined intervals (once per second)
-                if frame_idx % frame_interval == 0:
-                    for face_id, (x, y, w, h) in tracked_faces.items():
-                        face_region = frame[y:y+h, x:x+w]
-                        if face_region.size == 0:
-                            continue
-
-                        # Convert face region from BGR to RGB and wrap with PIL Image
-                        pil_face = Image.fromarray(cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB))
-                        emotions = self._analyze_emotions(pil_face)
-                        if emotions:
-                            face_emotions[face_id] = emotions
-                            timestamp_sec = frame_idx / fps
-                            emotions_over_time.append({
-                                "timestamp": float(timestamp_sec),
-                                "emotions": emotions,
-                                "face_position": (int(x), int(y), int(w), int(h)),
-                                "face_id": face_id
-                            })
-
-                # Draw annotations for every frame
-                for face_id, (x, y, w, h) in tracked_faces.items():
-                    # Draw face rectangle
-                    cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                    
-                    # Retrieve last known emotions for this face
-                    emotions = face_emotions.get(face_id, None)
-                    if emotions:
-                        # Compute the emotion with the highest score
-                        top_emotion = max(emotions.items(), key=lambda item: item[1])
-                        label = f"{top_emotion[0]} ({top_emotion[1]:.0%})"
-                        logger.debug(f"Face {face_id}: {label}")
-                    else:
-                        # Fallback if no emotion is detected
-                        label = "No emotion"
-                        logger.debug(f"Face {face_id}: No emotion detected")
-                    
-                    cv2.putText(frame, label, (x, y - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-
-                # Write frame to output video
+                
+                # Detect faces
+                detected_faces = self._detect_faces(gray_frame)
+                
+                # Update face tracking
+                self._update_face_tracking(detected_faces)
+                
+                # Process emotions periodically or on key frames
+                if frame_idx % frame_interval == 0 and self.model is not None:
+                    self._process_emotions(frame, frame_idx, fps, emotions_over_time)
+                
+                # Annotate the frame with bounding boxes and emotion labels
+                self._annotate_frame(frame)
+                
+                # Write the processed frame to the output video
                 out.write(frame)
+                
+                # Display progress periodically
+                if processed_frames % 100 == 0:
+                    logger.info(f"Processed {processed_frames}/{total_frames} frames ({processed_frames/total_frames*100:.1f}%)")
 
+            # Cleanup
             cap.release()
             out.release()
-
+            cv2.destroyAllWindows()
+            
+            # Aggregate the results
             visual_results = self._aggregate_results(emotions_over_time, duration)
-            return {
+            
+            # Save the results to disk
+            result_dict = {
                 "status": "success",
                 "video_info": {
                     "duration": duration,
@@ -184,6 +288,12 @@ class VideoProcessor:
                     "annotated_video_path": annotated_path
                 }
             }
+            
+            # Save results to file
+            self.save_results(video_id, result_dict)
+            
+            logger.info(f"Video processing completed: {video_path}")
+            return result_dict
 
         except Exception as e:
             logger.error(f"Error processing video: {str(e)}")
@@ -192,26 +302,177 @@ class VideoProcessor:
                 "error": str(e)
             }
 
-    def _analyze_emotions(self, face_image: Image) -> Optional[Dict[str, float]]:
+    def _detect_faces(self, gray_frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Runs the Hugging Face image-classification pipeline
-        to detect emotions in a face image.
+        Detect faces in a grayscale frame.
+        
+        Args:
+            gray_frame: Grayscale image as numpy array
+            
+        Returns:
+            List of (x, y, w, h) tuples for detected faces
         """
-        if self.emotion_detector is None:
-            return None
-
         try:
-            results = self.emotion_detector(face_image)
-            logger.info(f"Emotion detector raw results: {results}")
-            return {item["label"]: float(item["score"]) for item in results}
+            faces = self.face_cascade.detectMultiScale(
+                gray_frame,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(30, 30)
+            )
+            
+            # Convert to list of tuples
+            if len(faces) > 0:
+                return [(x, y, w, h) for (x, y, w, h) in faces]
+            else:
+                return []
         except Exception as e:
-            logger.error(f"Error in emotion classification: {str(e)}")
-            return None
+            logger.error(f"Error in face detection: {str(e)}")
+            return []
+
+    def _update_face_tracking(self, detected_faces: List[Tuple[int, int, int, int]]):
+        """
+        Update the face tracking across frames.
+        
+        Args:
+            detected_faces: List of (x, y, w, h) tuples for detected faces
+        """
+        updated_tracked_faces = OrderedDict()
+        
+        for (x, y, w, h) in detected_faces:
+            matched_id = None
+            min_dist = float('inf')
+            
+            # Try to match with existing faces by position
+            for face_id, (tx, ty, tw, th) in self.tracked_faces.items():
+                # Calculate center points
+                curr_center_x = x + w/2
+                curr_center_y = y + h/2
+                tracked_center_x = tx + tw/2
+                tracked_center_y = ty + th/2
+                
+                # Euclidean distance between centers
+                dist = np.hypot(curr_center_x - tracked_center_x, curr_center_y - tracked_center_y)
+                
+                # Match if distance is below threshold (50 pixels)
+                if dist < min_dist and dist < 50:
+                    min_dist = dist
+                    matched_id = face_id
+            
+            if matched_id is not None:
+                # Update position of existing face
+                updated_tracked_faces[matched_id] = (x, y, w, h)
+            else:
+                # Add new face
+                updated_tracked_faces[self.next_face_id] = (x, y, w, h)
+                self.next_face_id += 1
+        
+        # Update tracked faces
+        self.tracked_faces = updated_tracked_faces
+
+    def _process_emotions(self, frame: np.ndarray, frame_idx: int, fps: float, emotions_over_time: List[Dict[str, Any]]):
+        """
+        Process emotions for all tracked faces in the current frame.
+        
+        Args:
+            frame: Current video frame
+            frame_idx: Current frame index
+            fps: Frames per second
+            emotions_over_time: List to store emotion data over time
+        """
+        timestamp_sec = frame_idx / fps
+        
+        for face_id, (x, y, w, h) in self.tracked_faces.items():
+            # Ensure coordinates are within image bounds
+            x, y, w, h = max(0, x), max(0, y), w, h
+            
+            # Apply minimum size constraints (skip if face is too small)
+            if w < 20 or h < 20:
+                continue
+                
+            # Ensure we don't exceed image boundaries
+            h_max = min(y + h, frame.shape[0])
+            w_max = min(x + w, frame.shape[1])
+            
+            # Skip if adjusted size is too small
+            if h_max - y < 10 or w_max - x < 10:
+                continue
+                
+            # Extract face region
+            face_region = frame[y:h_max, x:w_max]
+            
+            # Skip empty regions
+            if face_region.size == 0:
+                continue
+            
+            # Convert to RGB for the model
+            rgb_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
+            pil_face = Image.fromarray(rgb_face)
+            
+            # Apply transformations and run the model
+            face_tensor = self.transform(pil_face).unsqueeze(0).to(self.device)
+            
+            try:
+                with torch.no_grad():
+                    outputs = self.model(face_tensor)
+                    probabilities = torch.nn.functional.softmax(outputs, dim=1)[0]
+                    
+                    # Get emotion predictions and scores
+                    emotions = {}
+                    for i, prob in enumerate(probabilities):
+                        emotion_label = self.emotion_mapping.get(i, f"emotion_{i}")
+                        emotions[emotion_label] = float(prob)
+                    
+                    # Store emotions for this face
+                    self.face_emotions[face_id] = emotions
+                    
+                    # Add to timeline
+                    emotions_over_time.append({
+                        "timestamp": float(timestamp_sec),
+                        "emotions": emotions,
+                        "face_position": (int(x), int(y), int(w), int(h)),
+                        "face_id": face_id
+                    })
+            except Exception as e:
+                logger.error(f"Error in emotion prediction: {str(e)}")
+
+    def _annotate_frame(self, frame: np.ndarray):
+        """
+        Annotate the frame with bounding boxes and emotion labels.
+        
+        Args:
+            frame: Current video frame to annotate
+        """
+        for face_id, (x, y, w, h) in self.tracked_faces.items():
+            # Draw face rectangle
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            
+            # Add face ID
+            cv2.putText(frame, f"Face {face_id}", (x, y - 35), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            # Get emotions for this face
+            emotions = self.face_emotions.get(face_id)
+            if emotions:
+                # Find the highest scoring emotion
+                top_emotion = max(emotions.items(), key=lambda item: item[1])
+                emotion_label = top_emotion[0]
+                emotion_score = top_emotion[1]
+                
+                # Add emotion label with score
+                label = f"{emotion_label} ({emotion_score:.2f})"
+                cv2.putText(frame, label, (x, y - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
     def _aggregate_results(self, emotions_over_time: List[Dict[str, Any]], duration: float) -> Dict[str, Any]:
         """
-        Aggregates emotion data over all sampled frames.
-        Returns average emotions, peak emotions, and a timeline.
+        Aggregate emotion data across all frames.
+        
+        Args:
+            emotions_over_time: List of emotion data points
+            duration: Video duration in seconds
+            
+        Returns:
+            Dictionary with aggregated emotion metrics
         """
         if not emotions_over_time:
             return {
@@ -220,49 +481,95 @@ class VideoProcessor:
                 "timeline": []
             }
 
-        emotion_sums: Dict[str, float] = {}
-        emotion_counts: Dict[str, int] = {}
-        timeline: List[Dict[str, Any]] = []
-
+        # Group emotions by face ID
+        faces_data = {}
         for entry in emotions_over_time:
-            timestamp = float(entry["timestamp"])
-            face_emotions = {k: float(v) for k, v in entry["emotions"].items()}
-
-            timeline.append({
-                "timestamp": timestamp,
-                "emotions": face_emotions,
-                "face_position": entry["face_position"]
-            })
-
-            for label, score in face_emotions.items():
-                emotion_sums[label] = emotion_sums.get(label, 0.0) + score
-                emotion_counts[label] = emotion_counts.get(label, 0) + 1
-
-        average_emotions = {
-            label: emotion_sums[label] / emotion_counts[label]
-            for label in emotion_sums
-        }
-
-        peak_emotions: Dict[str, Dict[str, float]] = {}
-        for data in timeline:
-            for label, score in data["emotions"].items():
-                if label not in peak_emotions or score > peak_emotions[label]["score"]:
-                    peak_emotions[label] = {"score": score, "timestamp": data["timestamp"]}
-
+            face_id = entry["face_id"]
+            if face_id not in faces_data:
+                faces_data[face_id] = []
+            faces_data[face_id].append(entry)
+        
+        all_average_emotions = {}
+        all_peak_emotions = {}
+        timeline = []
+        
+        # Process each face separately
+        for face_id, face_entries in faces_data.items():
+            # Calculate average emotions for this face
+            emotion_sums = {}
+            emotion_counts = {}
+            
+            for entry in face_entries:
+                for emotion, score in entry["emotions"].items():
+                    if emotion not in emotion_sums:
+                        emotion_sums[emotion] = 0
+                        emotion_counts[emotion] = 0
+                    emotion_sums[emotion] += score
+                    emotion_counts[emotion] += 1
+            
+            # Calculate averages
+            face_average_emotions = {
+                emotion: emotion_sums[emotion] / emotion_counts[emotion]
+                for emotion in emotion_sums
+            }
+            
+            # Find peak emotions
+            face_peak_emotions = {}
+            for entry in face_entries:
+                for emotion, score in entry["emotions"].items():
+                    if emotion not in face_peak_emotions or score > face_peak_emotions[emotion]["score"]:
+                        face_peak_emotions[emotion] = {
+                            "score": score,
+                            "timestamp": entry["timestamp"]
+                        }
+            
+            # Add to global aggregates
+            all_average_emotions[f"face_{face_id}"] = face_average_emotions
+            all_peak_emotions[f"face_{face_id}"] = face_peak_emotions
+            
+            # Add all entries to timeline
+            timeline.extend(face_entries)
+        
+        # Sort timeline by timestamp
+        timeline.sort(key=lambda x: x["timestamp"])
+        
         return {
-            "average_emotions": average_emotions,
-            "peak_emotions": peak_emotions,
-            "timeline": timeline
+            "average_emotions": all_average_emotions,
+            "peak_emotions": all_peak_emotions,
+            "timeline": timeline,
+            "face_count": len(faces_data)
         }
 
     def _get_video_writer(self, output_path: str, fps: float, frame_size: Tuple[int, int]) -> cv2.VideoWriter:
         """
-        Creates and returns a VideoWriter with proper MP4 codec configuration.
+        Create a video writer with appropriate codec settings.
+        
+        Args:
+            output_path: Path to save the output video
+            fps: Frames per second
+            frame_size: (width, height) of the video frames
+            
+        Returns:
+            Initialized VideoWriter object
         """
         try:
-            # Use MP4V codec for broad compatibility (including on macOS)
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            frame_size = (int(frame_size[0]), int(frame_size[1]))
+            # Ensure output directory exists
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
+            # Get codec based on file extension
+            ext = os.path.splitext(output_path)[1].lower()
+            
+            if ext == '.mp4':
+                # Default to MP4V for MP4 format (broadly compatible)
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            elif ext == '.avi':
+                # XVID for AVI format
+                fourcc = cv2.VideoWriter_fourcc(*'XVID')
+            else:
+                # Default to MP4V for unknown extensions
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            
+            # Create the video writer
             writer = cv2.VideoWriter(
                 filename=output_path,
                 fourcc=fourcc,
@@ -270,8 +577,10 @@ class VideoProcessor:
                 frameSize=frame_size,
                 isColor=True
             )
+            
             if not writer.isOpened():
                 raise RuntimeError(f"Failed to initialize VideoWriter for {output_path}")
+                
             return writer
         except Exception as e:
             logger.error(f"Video writer error: {str(e)}")
@@ -279,27 +588,24 @@ class VideoProcessor:
 
     def save_results(self, video_id: str, results: Dict[str, Any]) -> str:
         """
-        Saves result dictionaries to JSON files in the output directory.
+        Save analysis results to a JSON file.
+        
+        Args:
+            video_id: Identifier for the video
+            results: Dictionary of analysis results
+            
+        Returns:
+            Path to the saved results file
         """
         try:
             self.output_dir.mkdir(exist_ok=True, parents=True)
-
-            # Main results file (all data)
+            
+            # Main results file
             results_path = self.output_dir / f"{video_id}_results.json"
             with results_path.open('w') as f:
                 json.dump(results, f, indent=4)
-
-            # Optional script file (transcription) — empty by default here
-            script_path = self.output_dir / f"{video_id}_script.json"
-            with script_path.open('w') as f:
-                json.dump({"transcription": ""}, f, indent=4)
-
-            # Optional audio analysis file — empty by default here
-            audio_analysis_path = self.output_dir / f"{video_id}_audio_analysis.json"
-            with audio_analysis_path.open("w") as f:
-                json.dump({}, f, indent=4)
-
-            logger.info(f"Saved video-only results for {video_id}")
+            
+            logger.info(f"Saved video results for {video_id}")
             return str(results_path)
         except Exception as e:
             logger.error(f"Failed to save video results: {str(e)}")
@@ -307,10 +613,200 @@ class VideoProcessor:
 
     def get_results(self, video_id: str) -> Optional[Dict[str, Any]]:
         """
-        Retrieves saved results (if any) from the output directory.
+        Retrieve saved analysis results.
+        
+        Args:
+            video_id: Identifier for the video
+            
+        Returns:
+            Dictionary of analysis results or None if not found
         """
         results_path = self.output_dir / f"{video_id}_results.json"
         if results_path.exists():
             with results_path.open('r') as f:
                 return json.load(f)
         return None
+        
+    def process_webcam(self, output_file: str = None, display: bool = True, max_duration: int = None) -> str:
+        """
+        Process video directly from webcam with real-time emotion analysis.
+        
+        Args:
+            output_file: Optional path to save the output video
+            display: Whether to display the video during processing
+            max_duration: Maximum recording duration in seconds (None for unlimited)
+            
+        Returns:
+            Path to the saved output video (if output_file was specified)
+        """
+        try:
+            # Initialize webcam capture
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                raise ValueError("Could not open webcam")
+            
+            # Get video properties
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps <= 0:
+                fps = 30.0  # Default to 30 FPS if not properly reported
+                
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            
+            # Initialize video writer if output file is specified
+            out = None
+            if output_file:
+                out = self._get_video_writer(output_file, fps, (frame_width, frame_height))
+            
+            # Reset tracking state
+            self.tracked_faces = OrderedDict()
+            self.next_face_id = 0
+            self.face_emotions = {}
+            
+            # Variables for emotion analysis
+            emotions_over_time = []
+            frame_count = 0
+            start_time = cv2.getTickCount() / cv2.getTickFrequency()
+            
+            logger.info("Starting webcam processing. Press 'q' to stop.")
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                # Update frame count and calculate elapsed time
+                frame_count += 1
+                current_time = cv2.getTickCount() / cv2.getTickFrequency()
+                elapsed_time = current_time - start_time
+                
+                # Check if we've reached the maximum duration
+                if max_duration and elapsed_time > max_duration:
+                    logger.info(f"Reached maximum duration of {max_duration} seconds")
+                    break
+                
+                # Convert frame to grayscale for face detection
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                
+                # Detect faces
+                detected_faces = self._detect_faces(gray_frame)
+                
+                # Update face tracking
+                self._update_face_tracking(detected_faces)
+                
+                # Process emotions (every 3 frames for performance)
+                if frame_count % 3 == 0 and self.model is not None:
+                    self._process_emotions(frame, frame_count, fps, emotions_over_time)
+                
+                # Annotate the frame
+                self._annotate_frame(frame)
+                
+                # Add time counter to the frame
+                cv2.putText(frame, f"Time: {elapsed_time:.1f}s", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # Write frame to output if specified
+                if out:
+                    out.write(frame)
+                
+                # Display the frame if requested
+                if display:
+                    cv2.imshow('Emotion Recognition', frame)
+                    
+                    # Exit on 'q' key
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        break
+            
+            # Cleanup
+            cap.release()
+            if out:
+                out.release()
+            cv2.destroyAllWindows()
+            
+            # If output file was specified, save the analysis results
+            if output_file:
+                video_id = Path(output_file).stem
+                
+                # Calculate duration based on frame count and FPS
+                duration = frame_count / fps
+                
+                # Aggregate results
+                visual_results = self._aggregate_results(emotions_over_time, duration)
+                
+                # Save results to file
+                results_dict = {
+                    "status": "success",
+                    "video_info": {
+                        "duration": duration,
+                        "total_frames": frame_count,
+                        "fps": fps,
+                        "width": frame_width,
+                        "height": frame_height
+                    },
+                    "analysis": {
+                        "visual_analysis": visual_results,
+                        "annotated_video_path": output_file
+                    }
+                }
+                
+                self.save_results(video_id, results_dict)
+                logger.info(f"Webcam processing completed and saved to {output_file}")
+                
+                return output_file
+            else:
+                logger.info("Webcam processing completed (no output file specified)")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error processing webcam: {str(e)}")
+            return None
+
+# Example usage
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
+    # Ask user to select device
+    print("Select computing device:")
+    print("1. Auto-detect (recommended)")
+    print("2. CUDA (NVIDIA GPU)")
+    print("3. MPS (Apple Silicon)")
+    print("4. CPU")
+    
+    choice = input("Enter your choice (1-4): ")
+    
+    device = None
+    if choice == '2':
+        device = "cuda"
+    elif choice == '3':
+        device = "mps"
+    elif choice == '4':
+        device = "cpu"
+    # For choice 1 or invalid input, device remains None for auto-detection
+    
+    model_path = "best_emotion_model.pth"
+    processor = VideoProcessor(model_path=model_path, device=device)
+    
+    # Ask what to process
+    print("\nWhat would you like to do?")
+    print("1. Process video file")
+    print("2. Process from webcam")
+    
+    action = input("Enter your choice (1-2): ")
+    
+    if action == '1':
+        video_path = input("Enter video path: ")
+        result = processor.process_video(video_path)
+        print(f"Processing complete. Results saved to: {result.get('analysis', {}).get('annotated_video_path', 'unknown')}")
+    else:
+        output_file = input("Enter output file name (or press Enter for default 'webcam_output.mp4'): ")
+        if not output_file:
+            output_file = "webcam_output.mp4"
+            
+        max_duration = input("Enter maximum recording duration in seconds (or press Enter for 60s): ")
+        if not max_duration:
+            max_duration = 60
+        else:
+            max_duration = int(max_duration)
+            
+        processor.process_webcam(output_file=output_file, max_duration=max_duration)
+        print(f"Recording complete. Output saved to: {output_file}")
