@@ -3,16 +3,29 @@ import logging
 import json
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
-
 import cv2
 import numpy as np
 import torch
 from PIL import Image
 from torchvision import transforms
 from collections import OrderedDict
-from ..models import emotions
-from ..models import arcface
 
+# Import MTCNN
+MTCNN = None
+try:
+    # Try absolute import first
+    from mtcnn.mtcnn import MTCNN
+    logging.getLogger(__name__).info("Imported MTCNN successfully")
+except ImportError:
+    try:
+        # Try pip package name
+        from mtcnn import MTCNN
+        logging.getLogger(__name__).info("Imported MTCNN successfully (alternative import)")
+    except ImportError:
+        MTCNN = None
+        logging.getLogger(__name__).warning("MTCNN not found. Install with: pip install mtcnn")
+
+# Conditionally import specific modules for your model
 try:
     from ..models.emotions import EmotionRecognitionModel
     from ..models.arcface import ArcFaceBackbone
@@ -20,8 +33,8 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("Could not import model modules - will attempt import when loading model")
 
-logger = logging.getLogger(__name__)
-
+# Default emotion mapping (can be overridden by model-specific mapping)
+# Adjusted to 8 emotions based on your model's num_emotions=8
 DEFAULT_EMOTION_MAPPING = {
     0: "angry",
     1: "disgust", 
@@ -33,12 +46,14 @@ DEFAULT_EMOTION_MAPPING = {
     7: "contempt"  # Added contempt as the 8th emotion
 }
 
+logger = logging.getLogger(__name__)
+
 class VideoProcessor:
     """
     Enhanced Video Processor for face detection and emotion recognition.
     
     Features:
-    - Supports multiple face detection backends
+    - Supports MTCNN face detection (more accurate)
     - Loads custom emotion recognition models
     - Works with both CUDA and MPS (Apple Silicon)
     - Tracks faces across frames
@@ -97,19 +112,25 @@ class VideoProcessor:
 
     def _init_face_detector(self):
         """
-        Initialize the face detection system using OpenCV's Haar cascade.
-        Can be extended to support more advanced detectors.
+        Initialize the face detection system using MTCNN or fall back to Haar cascade.
         """
         try:
-            # Use OpenCV's built-in Haar cascade detector for compatibility
-            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            self.face_cascade = cv2.CascadeClassifier(cascade_path)
-            
-            if self.face_cascade.empty():
-                logger.error("Failed to load Haar cascade for face detection")
-                raise RuntimeError("Failed to load face detection model")
+            # First try MTCNN (better quality but requires additional package)
+            if MTCNN is not None:
+                self.use_mtcnn = True
+                self.face_detector = MTCNN()
+                logger.info("MTCNN face detector initialized successfully")
+            else:
+                # Fall back to OpenCV's Haar cascade
+                self.use_mtcnn = False
+                cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+                self.face_cascade = cv2.CascadeClassifier(cascade_path)
                 
-            logger.info("Face detector initialized successfully")
+                if self.face_cascade.empty():
+                    logger.error("Failed to load Haar cascade for face detection")
+                    raise RuntimeError("Failed to load face detection model")
+                    
+                logger.info("Face detector initialized successfully (using Haar cascade as fallback)")
         except Exception as e:
             logger.error(f"Error initializing face detector: {str(e)}")
             raise
@@ -128,15 +149,23 @@ class VideoProcessor:
             
             logger.info(f"Loading emotion model from: {model_path}")
             
+            # Import the model class from your models module
+            # This approach assumes the model architecture is accessible via import
             try:
-                from ..models.emotions import EmotionRecognitionModel
+                try:
+                    from ..models.emotions import EmotionRecognitionModel
+                except ImportError:
+                    # Try absolute import
+                    from src.models.emotions import EmotionRecognitionModel
                 logger.info("Successfully imported EmotionRecognitionModel")
             except ImportError as e:
                 logger.error(f"Failed to import EmotionRecognitionModel: {e}")
                 raise ImportError(f"Could not import EmotionRecognitionModel: {e}")
-
-
-            self.model = EmotionRecognitionModel(embedding_size=512, num_emotions=8, freeze_backbone=True)
+            
+            # Create model instance with your complex architecture
+            # Using the parameters based on your implementation
+            # Note: Setting freeze_backbone=False as in your original code
+            self.model = EmotionRecognitionModel(embedding_size=512, num_emotions=8, freeze_backbone=False)
             
             # Load model weights
             checkpoint = torch.load(model_path, map_location=self.device)
@@ -225,7 +254,7 @@ class VideoProcessor:
 
             # Variables for emotion analysis and face tracking
             emotions_over_time: List[Dict[str, Any]] = []
-            frame_interval = max(1, int(fps / 8))  # Process emotions every 1/8 second for smoother results
+            frame_interval = 1  # Process emotions on every frame for better accuracy
             self.tracked_faces = OrderedDict()
             self.next_face_id = 0
             self.face_emotions = {}
@@ -243,17 +272,14 @@ class VideoProcessor:
                 frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
                 processed_frames += 1
                 
-                # Convert frame to grayscale for face detection
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
                 # Detect faces
-                detected_faces = self._detect_faces(gray_frame)
+                detected_faces = self._detect_faces(frame)
                 
                 # Update face tracking
                 self._update_face_tracking(detected_faces)
                 
-                # Process emotions periodically or on key frames
-                if frame_idx % frame_interval == 0 and self.model is not None:
+                # Process emotions on every frame if model is loaded
+                if self.model is not None:
                     self._process_emotions(frame, frame_idx, fps, emotions_over_time)
                 
                 # Annotate the frame with bounding boxes and emotion labels
@@ -293,6 +319,10 @@ class VideoProcessor:
             # Save results to file
             self.save_results(video_id, result_dict)
             
+            # Log the path to the annotated video
+            logger.info(f"Annotated video saved at: {annotated_path}")
+            logger.info(f"Output directory is: {self.output_dir}")
+            
             logger.info(f"Video processing completed: {video_path}")
             return result_dict
 
@@ -303,29 +333,50 @@ class VideoProcessor:
                 "error": str(e)
             }
 
-    def _detect_faces(self, gray_frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    def _detect_faces(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Detect faces in a grayscale frame.
+        Detect faces in a frame using either MTCNN or Haar cascade.
         
         Args:
-            gray_frame: Grayscale image as numpy array
+            frame: Frame image as numpy array
             
         Returns:
             List of (x, y, w, h) tuples for detected faces
         """
         try:
-            faces = self.face_cascade.detectMultiScale(
-                gray_frame,
-                scaleFactor=1.1,
-                minNeighbors=5,
-                minSize=(30, 30)
-            )
-            
-            # Convert to list of tuples
-            if len(faces) > 0:
-                return [(x, y, w, h) for (x, y, w, h) in faces]
+            if self.use_mtcnn:
+                # Convert to RGB for MTCNN (which expects RGB images)
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                
+                # Detect faces using MTCNN
+                detections = self.face_detector.detect_faces(rgb_frame)
+                
+                # Extract bounding boxes
+                faces = []
+                for detection in detections:
+                    x, y, w, h = detection["box"]
+                    # Ensure coordinates are within image bounds
+                    x = max(0, x)
+                    y = max(0, y)
+                    # Add to faces list
+                    if w > 0 and h > 0:
+                        faces.append((x, y, w, h))
+                return faces
             else:
-                return []
+                # Use Haar cascade (fallback method)
+                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                faces = self.face_cascade.detectMultiScale(
+                    gray_frame,
+                    scaleFactor=1.05,  # Lower value for better detection (1.05 instead of 1.1)
+                    minNeighbors=4,
+                    minSize=(30, 30)
+                )
+                
+                # Convert to list of tuples
+                if len(faces) > 0:
+                    return [(x, y, w, h) for (x, y, w, h) in faces]
+                else:
+                    return []
         except Exception as e:
             logger.error(f"Error in face detection: {str(e)}")
             return []
@@ -405,7 +456,7 @@ class VideoProcessor:
             if face_region.size == 0:
                 continue
             
-            # Convert to RGB for the model
+            # Convert to RGB for the model (important for consistent results)
             rgb_face = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
             pil_face = Image.fromarray(rgb_face)
             
@@ -415,23 +466,33 @@ class VideoProcessor:
             try:
                 with torch.no_grad():
                     outputs = self.model(face_tensor)
+                    # Get class probabilities
                     probabilities = torch.nn.functional.softmax(outputs, dim=1)[0]
                     
-                    # Get emotion predictions and scores
+                    # Get predicted class
+                    predicted_class = torch.argmax(outputs, dim=1).item()
+                    predicted_emotion = self.emotion_mapping.get(predicted_class, f"emotion_{predicted_class}")
+                    
+                    # Get emotion predictions and scores for all classes
                     emotions = {}
                     for i, prob in enumerate(probabilities):
                         emotion_label = self.emotion_mapping.get(i, f"emotion_{i}")
                         emotions[emotion_label] = float(prob)
                     
                     # Store emotions for this face
-                    self.face_emotions[face_id] = emotions
+                    self.face_emotions[face_id] = {
+                        "emotions": emotions,
+                        "top_emotion": predicted_emotion,
+                        "top_score": float(probabilities[predicted_class])
+                    }
                     
                     # Add to timeline
                     emotions_over_time.append({
                         "timestamp": float(timestamp_sec),
                         "emotions": emotions,
                         "face_position": (int(x), int(y), int(w), int(h)),
-                        "face_id": face_id
+                        "face_id": face_id,
+                        "top_emotion": predicted_emotion
                     })
             except Exception as e:
                 logger.error(f"Error in emotion prediction: {str(e)}")
@@ -447,22 +508,17 @@ class VideoProcessor:
             # Draw face rectangle
             cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
             
-            # Add face ID
-            cv2.putText(frame, f"Face {face_id}", (x, y - 35), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-            
             # Get emotions for this face
-            emotions = self.face_emotions.get(face_id)
-            if emotions:
-                # Find the highest scoring emotion
-                top_emotion = max(emotions.items(), key=lambda item: item[1])
-                emotion_label = top_emotion[0]
-                emotion_score = top_emotion[1]
-                
+            face_data = self.face_emotions.get(face_id)
+            if face_data:
                 # Add emotion label with score
-                label = f"{emotion_label} ({emotion_score:.2f})"
-                cv2.putText(frame, label, (x, y - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                label = f"{face_data['top_emotion']} ({face_data['top_score']:.2f})"
+                cv2.putText(frame, label, (x, y-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            else:
+                # If no emotion data yet, just show face ID
+                cv2.putText(frame, f"Face {face_id}", (x, y-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
     def _aggregate_results(self, emotions_over_time: List[Dict[str, Any]], duration: float) -> Dict[str, Any]:
         """
@@ -538,8 +594,29 @@ class VideoProcessor:
             "average_emotions": all_average_emotions,
             "peak_emotions": all_peak_emotions,
             "timeline": timeline,
-            "face_count": len(faces_data)
+            "face_count": len(faces_data),
+            "dominant_emotions": self._get_dominant_emotions(all_average_emotions)
         }
+    
+    def _get_dominant_emotions(self, all_average_emotions: Dict[str, Dict[str, float]]) -> Dict[str, str]:
+        """
+        Determine the dominant emotion for each face.
+        
+        Args:
+            all_average_emotions: Dictionary of average emotions by face
+            
+        Returns:
+            Dictionary mapping face IDs to dominant emotions
+        """
+        dominant_emotions = {}
+        for face_id, emotions in all_average_emotions.items():
+            if emotions:
+                dominant_emotion = max(emotions.items(), key=lambda x: x[1])
+                dominant_emotions[face_id] = {
+                    "emotion": dominant_emotion[0],
+                    "score": dominant_emotion[1]
+                }
+        return dominant_emotions
 
     def _get_video_writer(self, output_path: str, fps: float, frame_size: Tuple[int, int]) -> cv2.VideoWriter:
         """
@@ -686,17 +763,14 @@ class VideoProcessor:
                     logger.info(f"Reached maximum duration of {max_duration} seconds")
                     break
                 
-                # Convert frame to grayscale for face detection
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
                 # Detect faces
-                detected_faces = self._detect_faces(gray_frame)
+                detected_faces = self._detect_faces(frame)
                 
                 # Update face tracking
                 self._update_face_tracking(detected_faces)
                 
-                # Process emotions (every 3 frames for performance)
-                if frame_count % 3 == 0 and self.model is not None:
+                # Process emotions (on every frame for better performance)
+                if self.model is not None:
                     self._process_emotions(frame, frame_count, fps, emotions_over_time)
                 
                 # Annotate the frame

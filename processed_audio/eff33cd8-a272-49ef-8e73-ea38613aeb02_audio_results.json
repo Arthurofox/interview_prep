@@ -1,0 +1,46 @@
+{
+    "transcription": "",
+    "emotions": {
+        "average_emotions": {
+            "neutral": 0.13875339925289154,
+            "happy": 0.13415808975696564,
+            "sad": 0.12993647158145905,
+            "angry": 0.1238744854927063,
+            "fearful": 0.12312857061624527
+        },
+        "peak_emotions": {
+            "neutral": {
+                "score": 0.13875339925289154,
+                "timestamp": 0.0
+            },
+            "happy": {
+                "score": 0.13415808975696564,
+                "timestamp": 0.0
+            },
+            "sad": {
+                "score": 0.12993647158145905,
+                "timestamp": 0.0
+            },
+            "angry": {
+                "score": 0.1238744854927063,
+                "timestamp": 0.0
+            },
+            "fearful": {
+                "score": 0.12312857061624527,
+                "timestamp": 0.0
+            }
+        },
+        "timeline": [
+            {
+                "timestamp": 0.0,
+                "emotions": {
+                    "neutral": 0.13875339925289154,
+                    "happy": 0.13415808975696564,
+                    "sad": 0.12993647158145905,
+                    "angry": 0.1238744854927063,
+                    "fearful": 0.12312857061624527
+                }
+            }
+        ]
+    }
+}
