@@ -11,8 +11,8 @@ import uuid
 import aiofiles
 
 from src.config import get_settings
-from src.processors.video import VideoProcessor
-from src.processors.audio import AudioProcessor  # <-- Our new AudioProcessor
+from src.processors.video import VideoProcessor  
+from src.processors.audio import AudioProcessor
 
 # Configure logging
 logging.basicConfig(
@@ -52,7 +52,7 @@ app.add_middleware(
 # Ensure static directory exists and mount static files
 if not STATIC_DIR.exists():
     logger.error(f"Static directory not found at {STATIC_DIR}")
-    os.makedirs(STATIC_DIR)
+    os.makedirs(STATIC_DIR, exist_ok=True)
     logger.info(f"Created static directory at {STATIC_DIR}")
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -60,8 +60,34 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.mount("/videos", StaticFiles(directory=str(PROCESSED_VIDEOS_DIR)), name="videos")
 
 # Initialize processors
-video_processor = VideoProcessor()
-audio_processor = AudioProcessor(device=None)  # Auto-select CPU or GPU
+# Detect appropriate device (CUDA, MPS, or CPU)
+try:
+    import torch
+    if torch.cuda.is_available():
+        device = "cuda"
+        logger.info(f"Using CUDA: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch, 'mps') and torch.backends.mps.is_available():
+        device = "mps"
+        logger.info("Using MPS (Apple Silicon)")
+    else:
+        device = "cpu"
+        logger.info("Using CPU for processing")
+except Exception as e:
+    logger.error(f"Error detecting device: {e}")
+    device = "cpu"
+    logger.info("Falling back to CPU for processing")
+
+# Initialize processors with detected device
+model_path = "best_emotion_model.pth"
+if os.path.exists(model_path):
+    video_processor = VideoProcessor(model_path=model_path, device=device)
+    logger.info(f"Initialized VideoProcessor with model: {model_path}")
+else:
+    logger.warning(f"Model file not found: {model_path}")
+    video_processor = VideoProcessor(device=device)
+    logger.info("Initialized VideoProcessor without emotion model")
+
+audio_processor = AudioProcessor(device=device)  # Keep the existing AudioProcessor
 
 # In-memory dictionary to track processing status and results
 processing_tasks: Dict[str, dict] = {}

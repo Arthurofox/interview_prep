@@ -135,8 +135,12 @@ class WebcamRecorder {
             this.recordedChunks = [];
 
             // Initialize MediaRecorder with proper mime type
+            const mimeType = this.getSupportedMimeType();
+            console.log(`Using MIME type: ${mimeType}`);
+            
             this.mediaRecorder = new MediaRecorder(this.stream, {
-                mimeType: 'video/webm;codecs=vp8,opus'
+                mimeType: mimeType,
+                videoBitsPerSecond: 2500000 // 2.5 Mbps for better quality
             });
 
             this.mediaRecorder.ondataavailable = event => {
@@ -170,6 +174,25 @@ class WebcamRecorder {
             console.error('Error starting recording:', error);
             this.displayError('Failed to start recording: ' + error.message);
         }
+    }
+    
+    getSupportedMimeType() {
+        const types = [
+            'video/webm;codecs=vp8,opus',
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=h264,opus',
+            'video/webm',
+            'video/mp4'
+        ];
+        
+        for (const type of types) {
+            if (MediaRecorder.isTypeSupported(type)) {
+                return type;
+            }
+        }
+        
+        // Default to webm if none supported (will likely fail, but we try)
+        return 'video/webm';
     }
 
     stopRecording() {
@@ -208,7 +231,13 @@ class WebcamRecorder {
 
     async uploadRecording() {
         try {
-            const blob = new Blob(this.recordedChunks, { type: 'video/webm' });
+            // Create a blob from recorded chunks
+            const blob = new Blob(this.recordedChunks, { 
+                type: this.mediaRecorder.mimeType 
+            });
+            
+            console.log(`Recording complete. Size: ${(blob.size / (1024 * 1024)).toFixed(2)} MB`);
+            
             const formData = new FormData();
             formData.append('video', blob, 'interview.webm');
 
@@ -223,7 +252,8 @@ class WebcamRecorder {
             });
 
             if (!response.ok) {
-                throw new Error('Failed to upload video');
+                const errorText = await response.text();
+                throw new Error(`Server error (${response.status}): ${errorText}`);
             }
 
             const result = await response.json();
@@ -244,6 +274,10 @@ class WebcamRecorder {
     async pollProcessingStatus(videoId) {
         try {
             const response = await fetch(`/video-status/${videoId}`);
+            if (!response.ok) {
+                throw new Error(`Server error (${response.status})`);
+            }
+            
             const status = await response.json();
 
             if (status.status === "completed") {
@@ -260,12 +294,30 @@ class WebcamRecorder {
                 // Load and play the processed video
                 const processedVideo = document.getElementById("processedVideo");
                 if (processedVideo) {
-                    const videoUrl = `/videos/${videoId}_annotated.mp4`;
+                    // Use direct video path or construct from video ID
+                    let videoUrl;
+                    const videoPath = status.results?.video_results?.analysis?.annotated_video_path;
+                    
+                    if (videoPath) {
+                        // Extract filename from path and use as URL
+                        const filename = videoPath.split('/').pop();
+                        videoUrl = `/videos/${filename}`;
+                    } else {
+                        // Fallback to default path construction
+                        videoUrl = `/video/${videoId}`;
+                    }
+                    
                     console.log("Loading video from:", videoUrl);
                     processedVideo.src = videoUrl;
                     processedVideo.style.display = "block";
                     processedVideo.load();
-                    processedVideo.play();
+                    
+                    // Only autoplay if user has interacted with the page
+                    if (document.hasFocus()) {
+                        processedVideo.play().catch(err => {
+                            console.warn("Could not autoplay:", err);
+                        });
+                    }
                 }
             } else if (status.status === "failed") {
                 throw new Error(status.error || "Processing failed");
@@ -289,22 +341,57 @@ class WebcamRecorder {
             const va = videoAnalysis.visual_analysis;
             html += '<div class="analysis-section">';
             html += '<h4>Visual Emotions (Video)</h4>';
-
-            if (va.average_emotions) {
+            
+            // Check if we have per-face data
+            const faceKeys = Object.keys(va.average_emotions || {}).filter(k => k.startsWith('face_'));
+            
+            if (faceKeys.length > 0) {
+                // We have multiple faces, show each one separately
+                html += `<p>Detected ${va.face_count || faceKeys.length} faces in the video</p>`;
+                
+                for (const faceKey of faceKeys) {
+                    const faceEmotions = va.average_emotions[faceKey];
+                    const facePeakEmotions = va.peak_emotions[faceKey];
+                    
+                    html += `<h5>${faceKey.replace('_', ' ')}</h5>`;
+                    html += '<div style="margin-left: 15px;">';
+                    
+                    // Average emotions for this face
+                    html += '<strong>Average Emotions:</strong><ul class="emotion-list">';
+                    for (const [emo, val] of Object.entries(faceEmotions)) {
+                        html += `<li><strong>${emo}:</strong> ${(val * 100).toFixed(1)}%</li>`;
+                    }
+                    html += '</ul>';
+                    
+                    // Peak emotions for this face
+                    if (facePeakEmotions) {
+                        html += '<strong>Peak Emotions:</strong><ul class="emotion-list">';
+                        for (const [emo, data] of Object.entries(facePeakEmotions)) {
+                            html += `<li><strong>${emo}:</strong> ${(data.score * 100).toFixed(1)}% at ${data.timestamp.toFixed(1)}s</li>`;
+                        }
+                        html += '</ul>';
+                    }
+                    
+                    html += '</div>';
+                }
+            } else if (va.average_emotions && Object.keys(va.average_emotions).length > 0) {
+                // Single face or legacy format
                 html += '<ul class="emotion-list">';
                 for (const [emo, val] of Object.entries(va.average_emotions)) {
                     html += `<li><strong>${emo}:</strong> ${(val * 100).toFixed(1)}%</li>`;
                 }
                 html += '</ul>';
-            }
-            if (va.peak_emotions) {
-                html += '<h5>Peak Emotions</h5>';
-                html += '<ul class="emotion-list">';
-                for (const [emo, data] of Object.entries(va.peak_emotions)) {
-                    html += `<li><strong>${emo}:</strong> ${(data.score * 100).toFixed(1)}% at ${data.timestamp}s</li>`;
+                
+                if (va.peak_emotions) {
+                    html += '<h5>Peak Emotions</h5>';
+                    html += '<ul class="emotion-list">';
+                    for (const [emo, data] of Object.entries(va.peak_emotions)) {
+                        html += `<li><strong>${emo}:</strong> ${(data.score * 100).toFixed(1)}% at ${data.timestamp.toFixed(1)}s</li>`;
+                    }
+                    html += '</ul>';
                 }
-                html += '</ul>';
             }
+            
             html += '</div>';
         }
 
@@ -315,11 +402,11 @@ class WebcamRecorder {
             if (audioAnalysis.transcription) {
                 html += `<p><strong>Transcription:</strong> ${audioAnalysis.transcription}</p>`;
             }
+            
             if (audioAnalysis.emotions) {
                 const avg = audioAnalysis.emotions.average_emotions;
                 const peak = audioAnalysis.emotions.peak_emotions;
-                const timeline = audioAnalysis.emotions.timeline;
-
+                
                 if (avg && Object.keys(avg).length > 0) {
                     html += '<h5>Average Audio Emotions</h5><ul>';
                     for (const [emotion, score] of Object.entries(avg)) {
@@ -327,25 +414,16 @@ class WebcamRecorder {
                     }
                     html += '</ul>';
                 }
+                
                 if (peak && Object.keys(peak).length > 0) {
                     html += '<h5>Peak Audio Emotions</h5><ul>';
                     for (const [emotion, data] of Object.entries(peak)) {
-                        html += `<li>${emotion}: ${(data.score * 100).toFixed(1)}% (timestamp: ${data.timestamp})</li>`;
+                        html += `<li>${emotion}: ${(data.score * 100).toFixed(1)}% (timestamp: ${data.timestamp.toFixed(1)}s)</li>`;
                     }
                     html += '</ul>';
                 }
-                if (timeline && timeline.length > 0) {
-                    html += '<h5>Emotion Timeline</h5><ul>';
-                    timeline.forEach(entry => {
-                        html += `<li>[Audio Index ${entry.timestamp}] `;
-                        for (const [emoLabel, emoScore] of Object.entries(entry.emotions)) {
-                            html += `${emoLabel}: ${(emoScore * 100).toFixed(1)}%, `;
-                        }
-                        html += '</li>';
-                    });
-                    html += '</ul>';
-                }
             }
+            
             html += '</div>';
         }
 
@@ -356,7 +434,8 @@ class WebcamRecorder {
             html += `<ul>
                         <li>Duration: ${Math.round(info.duration)} s</li>
                         <li>Total Frames: ${info.total_frames}</li>
-                        <li>FPS: ${info.fps}</li>
+                        <li>FPS: ${info.fps.toFixed(1)}</li>
+                        <li>Resolution: ${info.width}×${info.height}</li>
                     </ul>`;
             html += '</div>';
         }
@@ -399,6 +478,26 @@ window.addEventListener('DOMContentLoaded', async () => {
                 recorder.stopRecording();
             });
         }
+        
+        // Add keyboard shortcuts for convenience
+        document.addEventListener('keydown', (event) => {
+            // Space bar to start/stop recording (if not in an input field)
+            if (event.code === 'Space' && document.activeElement.tagName !== 'INPUT' && 
+                document.activeElement.tagName !== 'TEXTAREA') {
+                event.preventDefault();
+                
+                if (!recorder.isRecording && !startBtn.disabled) {
+                    recorder.startRecording();
+                } else if (recorder.isRecording && !stopBtn.disabled) {
+                    recorder.stopRecording();
+                }
+            }
+            
+            // Escape key to stop recording
+            if (event.code === 'Escape' && recorder.isRecording) {
+                recorder.stopRecording();
+            }
+        });
     } catch (error) {
         console.error('Failed to initialize recorder:', error);
         recorder.displayError('Failed to initialize: ' + error.message);
