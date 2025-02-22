@@ -10,9 +10,9 @@ from pathlib import Path
 import uuid
 import aiofiles
 
-from src.config import get_settings
-from src.processors.video import VideoProcessor  
-from src.processors.audio import AudioProcessor
+from .config import get_settings
+from .processors.video import VideoProcessor  
+from .processors.audio import AudioProcessor
 
 # Configure logging
 logging.basicConfig(
@@ -27,7 +27,7 @@ PROCESSED_VIDEOS_DIR.mkdir(exist_ok=True)
 
 # Get the absolute path to the project root and static directory
 PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
-STATIC_DIR = PROJECT_ROOT / "src" / "interface" / "static"
+STATIC_DIR = PROJECT_ROOT / "interface" / "static"
 UPLOAD_DIR = PROJECT_ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
@@ -87,7 +87,7 @@ else:
     video_processor = VideoProcessor(device=device)
     logger.info("Initialized VideoProcessor without emotion model")
 
-audio_processor = AudioProcessor(device=device)  # Keep the existing AudioProcessor
+audio_processor = AudioProcessor(device="cpu")  
 
 # In-memory dictionary to track processing status and results
 processing_tasks: Dict[str, dict] = {}
